@@ -16,24 +16,43 @@ local t_name = ProtoField.string("dlplay.name", "Name", base.UNICODE)
 -- get nds rom packet
 local t_offset = ProtoField.uint16("dlplay.offset", "Offset", base.HEX)
 
--- keepalive form
+-- response
+local t_resp_magic = ProtoField.uint32("dlplay.resp.magic", "Magic", base.HEX)
+local t_resp_ident = ProtoField.uint16("dlplay.resp.ident", "Identifier", base.HEX)
+local t_resp_opcode = ProtoField.uint16("dlplay.resp.opcode", "Opcode", base.HEX)
+local t_resp_offset = ProtoField.uint32("dlplay.resp.offset", "Offset", base.HEX)
+local t_resp_flag = ProtoField.uint8("dlplay.resp.flag", "Flag", base.DEC)
+local t_resp_footer = ProtoField.bytes("dlplay.resp.footer", "Footer")
+
+-- keepalive
 local t_random = ProtoField.uint32("dlplay.random", "Random", base.HEX)
 
+-- strings
+local request_string = "DS -> Station"
+local response_string = "Station -> DS"
 
 
 dlplay.fields = {
-    t_magic, t_flag, t_port, t_opcode, t_seq, -- opcode packet general
-	t_bytelen, t_strlen, t_name, -- GET_DS_NAME packet
-	t_offset, -- GET_NDS_ROM
-	t_random, -- keepalive form
+    t_magic, t_flag, t_port, t_opcode, t_seq, -- REQUEST packet general
+	t_bytelen, t_strlen, t_name, -- SEND_DS_NAME packet
+	t_offset, -- DOWNLOAD_NDS_ROM
+	t_resp_magic, t_resp_ident, t_resp_opcode, t_resp_offset, t_resp_flag, t_resp_footer, -- RESPONSE packets
+	t_random, -- KeepAlive packet
 }
 
 g_opcodes = {
-	GET_INFO = 0x00,
-	GET_DS_NAME = 0x07,
-	GET_RSA = 0x08,
-	GET_NDS_ROM = 0x9
+	-- requests
+	INITALIZE_DOWNLOAD = 0x00,
+	SEND_DS_NAME = 0x07,
+	AWAITING_RSA_SIGNATURE = 0x08,
+	GET_NDS_ROM = 0x9,
+	
+	-- responses
+	AWAITNG_NAME = 0x01,
+	NDS_ROM_CHUNK = 0x04,
+	RSA_SIGNATURE = 0x03
 }
+
 
 local function get_opcode_name(opcode)
 
@@ -48,25 +67,26 @@ local function get_opcode_name(opcode)
 end
 
 
-local function set_ds_play_header(buffer, pinfo, tree, method)
+local function set_ds_play_header(buffer, pinfo, tree, direction, method)
 	local subtree = tree:add(dlplay, buffer(), dlplay.description .. " - " .. method)
 
-	pinfo.cols.protocol = dlplay.name
-	pinfo.cols.info = dlplay.description .. ": " .. method
+	pinfo.cols.protocol = dlplay.description .. " (" .. direction .. ")"
+	pinfo.cols.info = method
 	
 	return subtree
 	
 end
 
 
-local function parse_opcode(buffer, pinfo, tree)
+local function parse_request(buffer, pinfo, tree)
 	
 	if buffer(0,2):le_uint() == 0x8000 then
-		local subtree = set_ds_play_header(buffer, pinfo, tree, "Keep Alive (DS)")
+		local subtree = set_ds_play_header(buffer, pinfo, tree, request_string, "KEEP_ALIVE")
 		Dissector.get("data"):call(buffer,pinfo,subtree)
 		return true
 	end
 	
+		
 	local v_magic = buffer(0, 1)
 	local magic = v_magic:le_uint()
 
@@ -74,41 +94,43 @@ local function parse_opcode(buffer, pinfo, tree)
 	if magic ~= 0x04 then
 		return false
 	end
-
+	
 	local v_port = buffer(1, 1)
 	local flag = (v_port:le_uint() >> 4)
 	local port = v_port:le_uint() & 0x0F
+	
 
 	local v_opcode = buffer(2, 1)
 	local opcode = v_opcode:le_uint()
-
-	local v_index = buffer(3, 1)
-	local index = v_index:le_uint()
 	local opcode_name = get_opcode_name(opcode)
 
-	local v_data = buffer(4)
 
-	local length = buffer:len()
-	local subtree = set_ds_play_header(buffer, pinfo, tree, opcode_name)
+	local v_seq = buffer(3, 1)
+	local seq = v_seq:le_uint()
 	
-	
-	pinfo.columns["info"]:append(" op:" .. opcode)
-	pinfo.columns["info"]:append(" seq:" .. index)
 
-	
+	local subtree = set_ds_play_header(buffer, pinfo, tree, request_string, opcode_name)
+
+
 	subtree:add_le(t_magic, v_magic)
-	
+	subtree:add_le(t_port, v_port, port)
+
+	-- check flag is non-0 then display flag
 	if flag ~= 0 then
 		subtree:add_le(t_flag, v_port, flag)
 	end
-	subtree:add_le(t_port, v_port, port)
 
 	subtree:add_le(t_opcode, v_opcode, opcode )
-	subtree:add_le(t_seq, v_index, index)
+	pinfo.columns["info"]:append(" op:" .. opcode)
+
+	subtree:add_le(t_seq, v_seq, seq)
+	pinfo.columns["info"]:append(" seq:" .. seq)
 	
-	if opcode == g_opcodes.GET_DS_NAME then
-		
-		if index == 0 then
+	local v_data = buffer(4)
+	local length = buffer:len()
+
+	if opcode == g_opcodes.SEND_DS_NAME then		
+		if seq == 0 then
 
 			local v_bytelen = v_data(4,1)
 			local v_strlen = v_data(5,1)
@@ -116,8 +138,8 @@ local function parse_opcode(buffer, pinfo, tree)
 			local strlen = v_strlen:le_uint()
 			local bytelen = v_bytelen:le_uint()
 			
-			subtree:add(t_strlen, v_strlen, strlen)			
-			subtree:add(t_bytelen, v_bytelen, bytelen)			
+			subtree:add_le(t_strlen, v_strlen, strlen)			
+			subtree:add_le(t_bytelen, v_bytelen, bytelen)			
 			
 			pinfo.columns["info"]:append(" strlen:" .. strlen)
 			pinfo.columns["info"]:append(" bytelen:" .. bytelen)
@@ -133,7 +155,6 @@ local function parse_opcode(buffer, pinfo, tree)
 		local offset = v_offset:uint()
 		
 		subtree:add(t_offset, v_offset, offset)	
-		
 		pinfo.columns["info"]:append(" offset:" .. offset)
 		
 	else
@@ -144,24 +165,76 @@ local function parse_opcode(buffer, pinfo, tree)
 end
 
 local function parse_response(buffer, pinfo, tree)
-	local length = buffer:len()	
-	local subtree = set_ds_play_header(buffer, pinfo, tree, "Response")	
 
-	Dissector.get("data"):call(buffer,pinfo,subtree)
+	local v_magic = buffer(0, 4)
+	local magic = v_magic:uint()
+
+	-- check magic number	
+	if magic ~= 0x6010200 then
+		return false
+	end
+
+	local v_identifier = buffer(4, 2)
+	local identifier = v_identifier:uint()
+
+	local v_opcode = buffer(6, 1)
+	local opcode = v_opcode:le_uint()
+	local opcode_name = get_opcode_name(opcode)
+
+	local v_offset = buffer(7, 4)
+	local offset = v_offset:le_uint() >> 16
+
+	local subtree = set_ds_play_header(buffer, pinfo, tree, response_string, opcode_name)
+	
+	subtree:add(t_resp_magic, v_magic, magic)
+	subtree:add(t_resp_ident, v_identifier, identifier)
+
+	subtree:add_le(t_resp_opcode, v_opcode, opcode )
+	pinfo.columns["info"]:append(" op:" .. opcode)
+
+	-- add receive offset 
+	subtree:add_le(t_resp_offset, v_offset, offset)
+	if opcode == g_opcodes.NDS_ROM_CHUNK then
+		pinfo.columns["info"]:append(" offset:" .. offset)
+	end
+	
+	
+	local length = buffer:len()
+	local v_data = buffer(11, length-11-3)
+	local v_footer = buffer(length-3)
+	
+	subtree:add(t_resp_footer, v_footer)
+	
+	Dissector.get("data"):call(v_data:tvb(),pinfo,subtree)
 	return true
 end
 
 local function parse_keepalive(buffer, pinfo, tree)
 	local length = buffer:len()	
-	local subtree = set_ds_play_header(buffer, pinfo, tree, "Keep Alive (Station)")	
+	local subtree = set_ds_play_header(buffer, pinfo, tree, response_string, "KEEP_ALIVE")	
 	
     subtree:add(t_random, buffer(0, 4))
+	
 	return true
 end 
 
+function dump(o)
+   print(type(o))
+   if type(o) == 'table' or type(o) == 'userdata' then
+      local s = '{ '
+      for k,v in pairs(o) do
+         if type(k) ~= 'number' then k = '"'..k..'"' end
+         s = s .. '['..k..'] = ' .. dump(v) .. ','
+      end
+      return s .. '} '
+   else
+      return tostring(o)
+   end
+end
+
 function  dlplay.dissector(buffer, pinfo, tree)
 	local keepalive = Address.ether("03:09:bf:00:00:03")
-	local opcode = Address.ether("03:09:bf:00:00:10")
+	local request = Address.ether("03:09:bf:00:00:10")
 	local response = Address.ether("03:09:bf:00:00:00")
 	
 	-- cant figure out how to compare them properly
@@ -169,9 +242,9 @@ function  dlplay.dissector(buffer, pinfo, tree)
 		-- parse keepalive
 		return parse_keepalive(buffer, pinfo, tree)
 	end
-	if tostring(pinfo.dst) == tostring(opcode) then
-		-- parse t_opcode
-		return parse_opcode(buffer, pinfo, tree)
+	if tostring(pinfo.dst) == tostring(request) then
+		-- parse request
+		return parse_request(buffer, pinfo, tree)
 	end
 	if tostring(pinfo.dst) == tostring(response) then
 		-- parse response
